@@ -92,7 +92,7 @@ const MARS_SURVIVAL_THRESHOLDS = {
 };
 
 // ============================================================================
-// 3. DYNAMIC PER-RUN HAZARD POOLS
+// 3. DYNAMIC PER-RUN HAZARD POOLS & UNMITIGATED IMPACT TABLE
 // ============================================================================
 const STAGE_HAZARD_POOLS = {
   level1_prep_and_launch: [
@@ -159,6 +159,25 @@ const STAGE_HAZARD_POOLS = {
   ]
 };
 
+// Single most physically affected metric when a hazard hits unmitigated ("no")
+// currentMeters indices: [0: o2 (0-1), 1: water (%), 2: food (%), 3: power (%), 4: shield (%), 5: suitIntegrity (%), 6: tempC, 7: massKg, 8: fuelKg]
+const UNMITIGATED_HAZARD_IMPACTS = {
+  // Level 1: Launch
+  WIND_SHEAR:             { index: 8, delta: -45,   label: "Propellant burned fighting aerodynamic shear (-45 kg fuel)" },
+  GEOMAGNETIC_SPIKE:      { index: 3, delta: -18,   label: "Avionics bus surge drained battery (-18% power)" },
+  BOOSTER_VALVE_PRESSURE: { index: 0, delta: -0.15, label: "LOX feed fluctuation reduced oxygen reserve (-15% O2)" },
+
+  // Level 2: Deep Space Transit
+  NEO_PROXIMITY:          { index: 5, delta: -22,   label: "Debris strike damaged outer pressure shell (-22% suit integrity)" },
+  SOLAR_FLARE_CME:        { index: 4, delta: -25,   label: "Coronal mass ejection degraded radiation shielding (-25% shield)" },
+  MICROMETEOROID_IMPACT:  { index: 5, delta: -20,   label: "Micrometeoroid punctured radiator & suit layer (-20% suit integrity)" },
+
+  // Level 3: Mars Surface
+  MARS_DUST_SQUALL:       { index: 3, delta: -20,   label: "Dust opacity choked solar array charging (-20% power)" },
+  MARS_THERMAL_PLUNGE:    { index: 3, delta: -22,   label: "Katabatic freeze forced emergency suit heaters (-22% power)" },
+  MARS_TERRAIN_HAZARD:    { index: 5, delta: -18,   label: "Regolith abrasion damaged EVA boot & joint seals (-18% suit integrity)" }
+};
+
 function selectDynamicHazard(stageKey, nasaData, seenHazardIds = [], landingSite = null) {
   const pool = STAGE_HAZARD_POOLS[stageKey] || STAGE_HAZARD_POOLS.level2_transit;
   const activeSite = landingSite || pickLandingSite(nasaData);
@@ -177,9 +196,10 @@ async function processMissionEvent({ stageKey, currentMeters, seenHazardIds = []
   const hazard = selectDynamicHazard(stageKey, nasaData, seenHazardIds, activeLandingSite);
   const ariaResult = await getAriaEvent(stageKey, hazard.description, currentMeters);
 
-  // Only include updatedTelemetry & detailedMeters when user selects "yes"
-  const isYes = /^yes\b/i.test(String(decision || "").trim());
-  if (!isYes) {
+  const normalizedDecision = String(decision || "").trim().toLowerCase();
+
+  // 1. Initial encounter (no button clicked yet) -> pause and wait for player choice
+  if (!normalizedDecision) {
     return {
       missionStatus: "AWAITING_DECISION",
       activeLandingSite,
@@ -188,6 +208,64 @@ async function processMissionEvent({ stageKey, currentMeters, seenHazardIds = []
     };
   }
 
+  // 2. Player pressed "No" -> apply single most realistic physical impact
+  if (/^no\b/.test(normalizedDecision)) {
+    const meters = Array.isArray(currentMeters) ? [...currentMeters] : [1, 100, 100, 100, 100, 100, 21, 1200, 500];
+    const impact = UNMITIGATED_HAZARD_IMPACTS[hazard.id] || {
+      index: 5,
+      delta: -15,
+      label: "Unmitigated hazard stress (-15% suit integrity)"
+    };
+
+    if (impact.index === 0) {
+      meters[0] = Number(Math.max(0, Math.min(1, meters[0] + impact.delta)).toFixed(2));
+    } else if (impact.index >= 1 && impact.index <= 5) {
+      meters[impact.index] = Math.max(0, Math.min(100, meters[impact.index] + impact.delta));
+    } else {
+      meters[impact.index] = Math.max(0, meters[impact.index] + impact.delta);
+    }
+
+    const updatedTelemetry = {
+      oxygenLevel: Number((meters[0] * 100).toFixed(1)),
+      waterReserve: meters[1],
+      foodSupply: meters[2],
+      suitPower: meters[3],
+      radiationShield: meters[4],
+      suitIntegrity: meters[5]
+    };
+
+    const detailedMeters = {
+      temperatureC: meters[6],
+      payloadMassKg: meters[7],
+      fuelKg: meters[8]
+    };
+
+    const isCriticalFailure =
+      updatedTelemetry.oxygenLevel <= 0 ||
+      updatedTelemetry.suitPower <= 0 ||
+      updatedTelemetry.suitIntegrity <= 0 ||
+      detailedMeters.fuelKg <= 0;
+
+    const oxygenWarning = getLowOxygenWarning(updatedTelemetry.oxygenLevel);
+    const impactNotice = `⚠️ HAZARD IMPACT (${hazard.id}): ${impact.label}.`;
+
+    return {
+      missionStatus: isCriticalFailure ? "CRITICAL_FAILURE" : "ACTIVE",
+      decisionApplied: "NO",
+      activeLandingSite,
+      hazardTriggered: hazard,
+      impactSummary: impactNotice,
+      oxygenWarning,
+      ariaDialogue: oxygenWarning
+        ? `${oxygenWarning}\n\n${impactNotice}\n${ariaResult.ariaDialogue}`
+        : `${impactNotice}\n${ariaResult.ariaDialogue}`,
+      updatedTelemetry,
+      detailedMeters,
+      rawMeters: meters
+    };
+  }
+
+  // 3. Player pressed "Yes" -> apply standard mitigation tradeoff from llmservices
   const { oxygenLevel, suitPower } = ariaResult.updatedTelemetry;
   const { fuelKg } = ariaResult.detailedMeters;
   const isCriticalFailure = oxygenLevel <= 0 || suitPower <= 0 || fuelKg <= 0;
@@ -199,6 +277,7 @@ async function processMissionEvent({ stageKey, currentMeters, seenHazardIds = []
 
   return {
     missionStatus: isCriticalFailure ? "CRITICAL_FAILURE" : "ACTIVE",
+    decisionApplied: "YES",
     activeLandingSite,
     hazardTriggered: hazard,
     oxygenWarning,
@@ -312,5 +391,6 @@ module.exports = {
   getLowOxygenWarning,
   OXYGEN_WARNING_THRESHOLD,
   STAGE_PRESSURE_SPECS,
-  MARS_FOOD_TRADEOFFS
+  MARS_FOOD_TRADEOFFS,
+  UNMITIGATED_HAZARD_IMPACTS
 };
